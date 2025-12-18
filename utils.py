@@ -6,6 +6,7 @@ This module provides helper functions for:
 - Random seed setup for reproducibility
 - Results saving to Excel format
 - Parameter counting
+- Demographic data loading
 """
 
 import os
@@ -14,6 +15,7 @@ import numpy as np
 import random
 import xlwt
 import time
+import json
 
 
 def save_model_with_checks(model, save_path):
@@ -102,4 +104,86 @@ def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total_params, trainable_params
+
+
+def load_demographic_data(site, base_dir=None):
+    """
+    Load demographic data (age, sex, site_id) for a given site.
+    
+    Args:
+        site: Site name (e.g., 'NYU', 'UCLA', 'UM', 'USM')
+        base_dir: Base directory for data. If None, tries to find automatically.
+    
+    Returns:
+        tuple: (demographics_dict, index_to_file_id_list)
+               - demographics_dict: Mapping from FILE_ID to demographic info
+               - index_to_file_id_list: List mapping data index to FILE_ID
+               Returns (empty_dict, empty_list) if files not found.
+    """
+    if base_dir is None:
+        # Try to find data directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(current_dir)
+        
+        # Try BrainPrompt directory first
+        demographics_path_brainprompt = os.path.join(
+            parent_dir, 'BrainPrompt', 'data', 'correlation', site, 
+            f'{site}_15_site_demographics.json'
+        )
+        
+        # Try root data directory
+        demographics_path_root = os.path.join(
+            parent_dir, 'data', 'correlation', site,
+            f'{site}_15_site_demographics.json'
+        )
+        
+        if os.path.exists(demographics_path_brainprompt):
+            demographics_path = demographics_path_brainprompt
+            index_mapping_path = os.path.join(
+                parent_dir, 'BrainPrompt', 'data', 'correlation', site,
+                f'{site}_15_site_index_to_file_id.json'
+            )
+        elif os.path.exists(demographics_path_root):
+            demographics_path = demographics_path_root
+            index_mapping_path = os.path.join(
+                parent_dir, 'data', 'correlation', site,
+                f'{site}_15_site_index_to_file_id.json'
+            )
+        else:
+            print(f"Warning: Demographic data not found for site {site}")
+            print(f"  Tried: {demographics_path_brainprompt}")
+            print(f"  Tried: {demographics_path_root}")
+            return {}, []
+    else:
+        demographics_path = os.path.join(
+            base_dir, 'data', 'correlation', site,
+            f'{site}_15_site_demographics.json'
+        )
+        index_mapping_path = os.path.join(
+            base_dir, 'data', 'correlation', site,
+            f'{site}_15_site_index_to_file_id.json'
+        )
+    
+    if not os.path.exists(demographics_path):
+        print(f"Warning: Demographic data file not found: {demographics_path}")
+        return {}, []
+    
+    try:
+        with open(demographics_path, 'r', encoding='utf-8') as f:
+            demographics = json.load(f)
+        print(f"Loaded demographic data for {len(demographics)} subjects from {demographics_path}")
+        
+        # Load index mapping if available
+        index_to_file_id = []
+        if os.path.exists(index_mapping_path):
+            with open(index_mapping_path, 'r', encoding='utf-8') as f:
+                index_to_file_id = json.load(f)
+            print(f"Loaded index mapping for {len(index_to_file_id)} samples from {index_mapping_path}")
+        else:
+            print(f"Warning: Index mapping file not found: {index_mapping_path}")
+        
+        return demographics, index_to_file_id
+    except Exception as e:
+        print(f"Error loading demographic data: {e}")
+        return {}, []
 

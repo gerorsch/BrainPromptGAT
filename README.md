@@ -149,5 +149,4 @@ python main.py --model gnn_baseline_model --site NYU --gat_heads 4 --gat_hidden_
 - Baseline model is functional and ready for testing
 - Models with prompt learning will be implemented in subsequent phases
 - Default temporal strategy is `mean` (average of 25 windows)
-- Debug logging is available (enabled only in first iteration of first epoch)
 

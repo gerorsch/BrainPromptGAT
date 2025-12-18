@@ -5,7 +5,7 @@ This module implements the training and evaluation pipeline for the GAT baseline
 including 5-fold cross-validation, early stopping, learning rate scheduling, and
 comprehensive loss functions (Focal Loss, TopK Loss, Diversity Loss, L1 regularization).
 """
-from utils import save_model_with_checks, setup_seed, save_xlsx, count_parameters
+from utils import save_model_with_checks, setup_seed, save_xlsx, count_parameters, load_demographic_data
 from focal_loss_utils import FocalLoss
 import torch.optim as optim
 from torch.optim import lr_scheduler
@@ -22,12 +22,17 @@ import torch.nn.functional as F
 import random
 from sklearn.model_selection import train_test_split, KFold
 from graph_utils import load_matrix_data, temporal_graphs_to_batch
+from prompt_utils import generate_subject_prompt, generate_disease_prompts, get_class_names_for_dataset
 import warnings
 warnings.filterwarnings("ignore")
 
 
 def make_model_baseline_model(num_nodes=116, input_dim=116, hidden_dim=128, num_heads=2,
-                              num_layers=2, dropout=0.5, num_classes=2, temporal_strategy='mean', device=0):
+                              num_layers=2, dropout=0.5, num_classes=2, temporal_strategy='mean', 
+                              device=0, use_input_norm=False, use_layernorm_gat=False, use_residual=False,
+                              fc_hidden_dim=64, fc_num_layers=1, fc_activation='relu', fc_use_batchnorm=False,
+                              ablation_mode='full', ablation_mask='with_mask', ablation_pooling='attention',
+                              use_subject_prompt=False, use_disease_prompt=False, text_encoder=None):
     """
     Create and initialize GAT baseline model.
     
@@ -41,6 +46,9 @@ def make_model_baseline_model(num_nodes=116, input_dim=116, hidden_dim=128, num_
         num_classes (int): Number of output classes. Default: 2
         temporal_strategy (str): Temporal aggregation strategy. Default: 'mean'
         device (int): Device ID. Default: 0
+        use_input_norm (bool): Enable BatchNorm1d after prompt. Default: False
+        use_layernorm_gat (bool): Enable LayerNorm between GAT layers. Default: False
+        use_residual (bool): Enable residual connections. Default: False
     
     Returns:
         GATBaselineModel: Initialized model
@@ -53,7 +61,20 @@ def make_model_baseline_model(num_nodes=116, input_dim=116, hidden_dim=128, num_
         num_layers=num_layers,
         dropout=dropout,
         num_classes=num_classes,
-        temporal_strategy=temporal_strategy
+        temporal_strategy=temporal_strategy,
+        use_input_norm=use_input_norm,
+        use_layernorm_gat=use_layernorm_gat,
+        use_residual=use_residual,
+        fc_hidden_dim=fc_hidden_dim,
+        fc_num_layers=fc_num_layers,
+        fc_activation=fc_activation,
+        fc_use_batchnorm=fc_use_batchnorm,
+        ablation_mode=ablation_mode,
+        ablation_mask=ablation_mask,
+        ablation_pooling=ablation_pooling,
+        use_subject_prompt=use_subject_prompt,
+        use_disease_prompt=use_disease_prompt,
+        text_encoder=text_encoder
     )
     
     # Initialize parameters (optimized initialization)
@@ -61,9 +82,9 @@ def make_model_baseline_model(num_nodes=116, input_dim=116, hidden_dim=128, num_
     # with optimized values, so we skip them to avoid overwriting
     for name, p in model.named_parameters():
         if name == "soft_prompt":
-            continue  # Keep fine-tuning at zero (semantic base prompt already projected)
-        if name == "fc1.weight" or name == "fc1.bias":
-            continue  # Skip fc1 - already initialized in __init__ with optimized values
+            continue  # soft_prompt is initialized in __init__ based on ablation_mode
+        if name == "fc1.weight" or name == "fc1.bias" or name == "fc_final.weight" or name == "fc_final.bias":
+            continue  # Skip final layers - already initialized in __init__ with optimized values
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
         else:
@@ -99,9 +120,11 @@ def configure_model_optimizer_baseline_model(args, model, device, lr, decay):
         elif lr > 0.01:
             print(f"[Warning] LR too high ({lr}), may cause instability. Consider decreasing.")
         
-        # Force weight decay = 0 to avoid erasing weights
-        decay = 0.0
-        print(f"[Auto-Adjust] Weight Decay set to {decay}")
+        # Use weight decay from arguments (default 0.0, but can be set for regularization)
+        # Previously forced to 0.0, now allows user to set for anti-overfitting
+        if decay is None or decay < 0:
+            decay = 0.0
+        print(f"[Weight Decay] Using value: {decay}")
         
         model_param_group = []
         model_param_group.append({"params": model.parameters()})
@@ -139,6 +162,79 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
     X, X_mask = load_matrix_data(path_data, path_data_mask)
     Y = np.load(path_label)
     
+    # Load demographic data if subject prompts are enabled
+    demographics = {}
+    index_to_file_id = []
+    use_subject_prompt = getattr(args, 'use_subject_prompt', False)
+    use_disease_prompt = getattr(args, 'use_disease_prompt', False)
+    
+    if use_subject_prompt or use_disease_prompt:
+        demographics, index_to_file_id = load_demographic_data(args.site)
+        if not demographics:
+            print(f"Warning: No demographic data found for site {args.site}")
+            if use_subject_prompt:
+                print("  Disabling subject prompts")
+                use_subject_prompt = False
+            if use_disease_prompt:
+                print("  Disabling disease prompts")
+                use_disease_prompt = False
+    
+    # Initialize text encoder if needed (shared Llama-encoder-1.0B)
+    text_encoder = None
+    if use_subject_prompt or use_disease_prompt:
+        try:
+            from llm2vec import LLM2Vec
+            text_encoder = LLM2Vec.from_pretrained("knowledgator/Llama-encoder-1.0B")
+            text_encoder.eval()  # Freeze encoder
+            for param in text_encoder.parameters():
+                param.requires_grad = False
+            print("✓ Loaded Llama-encoder-1.0B for multi-level prompts")
+        except ImportError:
+            try:
+                from transformers import AutoModel, AutoTokenizer
+                class TextEncoderWrapper:
+                    def __init__(self):
+                        self.tokenizer = AutoTokenizer.from_pretrained("knowledgator/Llama-encoder-1.0B")
+                        self.model = AutoModel.from_pretrained("knowledgator/Llama-encoder-1.0B")
+                        self.model.eval()
+                        for param in self.model.parameters():
+                            param.requires_grad = False
+                text_encoder = TextEncoderWrapper()
+                print("✓ Loaded Llama-encoder-1.0B via transformers")
+            except Exception as e:
+                print(f"Warning: Could not load text encoder: {e}")
+                print("  Disabling subject and disease prompts")
+                use_subject_prompt = False
+                use_disease_prompt = False
+    
+    # Generate disease prompts if enabled
+    disease_prompt_embeddings = None
+    if use_disease_prompt and text_encoder is not None:
+        class_names = get_class_names_for_dataset('ABIDE', num_classes=2)
+        disease_prompts = generate_disease_prompts(class_names, 'ABIDE')
+        
+        # Encode disease prompts
+        with torch.no_grad():
+            if hasattr(text_encoder, 'encode'):
+                # LLM2Vec interface
+                disease_embeddings = text_encoder.encode(disease_prompts, convert_to_numpy=False, show_progress_bar=False)
+                if isinstance(disease_embeddings, torch.Tensor):
+                    disease_prompt_embeddings = disease_embeddings.to(device)
+                else:
+                    disease_prompt_embeddings = torch.tensor(disease_embeddings, device=device)
+            else:
+                # Transformers interface
+                disease_emb_list = []
+                for prompt in disease_prompts:
+                    inputs = text_encoder.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    outputs = text_encoder.model(**inputs)
+                    emb = outputs.last_hidden_state.mean(dim=1).squeeze()
+                    disease_emb_list.append(emb)
+                disease_prompt_embeddings = torch.stack(disease_emb_list).to(device)
+        
+        print(f"✓ Encoded {len(disease_prompts)} disease prompts")
+    
     # Convert to numpy for sklearn
     X = X.numpy()
     if X_mask is not None:
@@ -173,12 +269,21 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
         X_mask_train, X_mask_test = X_mask[train_index], X_mask[test_index]
         Y_train, Y_test = Y[train_index], Y[test_index]
         
+        # Store train_index and test_index for demographic mapping
+        # These are global indices that map to index_to_file_id
+        
         print('X_train{}'.format(X_train.shape))
         print('X_test{}'.format(X_test.shape))
         print('Y_train{}'.format(Y_train.shape))
         print('Y_test{}'.format(Y_test.shape))
         
         # Create model
+        # Disable improvements by default to restore original behavior
+        # Can be enabled individually to test impact
+        use_input_norm = getattr(args, 'use_input_norm', False)
+        use_layernorm_gat = getattr(args, 'use_layernorm_gat', False)  # Disabled by default
+        use_residual = getattr(args, 'use_residual', False)  # Disabled by default
+        
         model = make_model_baseline_model(
             num_nodes=116,
             input_dim=116,  # Each node gets its row from correlation matrix
@@ -188,8 +293,31 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
             dropout=args.dropout,
             num_classes=2,
             temporal_strategy=args.temporal_strategy,
-            device=device
+            device=device,
+            use_input_norm=use_input_norm,
+            use_layernorm_gat=use_layernorm_gat,
+            use_residual=use_residual,
+            fc_hidden_dim=getattr(args, 'fc_hidden_dim', 64),
+            fc_num_layers=getattr(args, 'fc_num_layers', 1),
+            fc_activation=getattr(args, 'fc_activation', 'relu'),
+            fc_use_batchnorm=getattr(args, 'fc_use_batchnorm', False),
+            ablation_mode=getattr(args, 'ablation_mode', 'full'),
+            ablation_mask=getattr(args, 'ablation_mask', 'with_mask'),
+            ablation_pooling=getattr(args, 'ablation_pooling', 'attention'),
+            use_subject_prompt=use_subject_prompt,
+            use_disease_prompt=use_disease_prompt,
+            text_encoder=text_encoder
         )
+        
+        # Set disease prompt embeddings in model if available
+        if use_disease_prompt and disease_prompt_embeddings is not None:
+            # Project to match hidden_dim if needed
+            if disease_prompt_embeddings.shape[1] != args.gat_hidden_dim:
+                disease_proj = nn.Linear(disease_prompt_embeddings.shape[1], args.gat_hidden_dim).to(device)
+                nn.init.xavier_uniform_(disease_proj.weight)
+                with torch.no_grad():
+                    disease_prompt_embeddings = disease_proj(disease_prompt_embeddings)
+            model.disease_prompt_embeddings = disease_prompt_embeddings
         
         # Clear memory before starting
         if torch.cuda.is_available():
@@ -216,30 +344,40 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
         # Create validation set for early stopping (20% of training data)
         # As in BrainGNN_Pytorch which uses train/val/test split
         val_size = int(0.2 * len(X_train))
-        val_indices = np.random.choice(len(X_train), size=val_size, replace=False)
-        train_indices = np.setdiff1d(np.arange(len(X_train)), val_indices)
+        val_indices_local = np.random.choice(len(X_train), size=val_size, replace=False)
+        train_indices_local = np.setdiff1d(np.arange(len(X_train)), val_indices_local)
         
-        X_train_final = X_train[train_indices]
-        X_val = X_train[val_indices]
-        X_mask_train_final = X_mask_train[train_indices]
-        X_mask_val = X_mask_train[val_indices]
-        Y_train_final = Y_train[train_indices]
-        Y_val = Y_train[val_indices]
+        X_train_final = X_train[train_indices_local]
+        X_val = X_train[val_indices_local]
+        X_mask_train_final = X_mask_train[train_indices_local]
+        X_mask_val = X_mask_train[val_indices_local]
+        Y_train_final = Y_train[train_indices_local]
+        Y_val = Y_train[val_indices_local]
         
-        # Class weights for focal loss (based on training set of this fold)
+        # Class weights (based on training set of this fold)
         num_class_0 = (Y_train_final == 0).sum()
         num_class_1 = (Y_train_final == 1).sum()
         total_samples = len(Y_train_final)
         weight_0 = total_samples / (2 * num_class_0 + 1e-6)
         weight_1 = total_samples / (2 * num_class_1 + 1e-6)
-        focal_alpha = torch.tensor([weight_0, weight_1], dtype=torch.float, device=device)
-        focal_gamma = getattr(args, 'focal_gamma', 2.0)
-        focal_loss_fn = FocalLoss(gamma=focal_gamma, alpha=focal_alpha, reduction='mean', num_classes=2)
+        
+        # Choose loss function based on args
+        loss_type = getattr(args, 'loss_type', 'focal')
+        if loss_type == 'bce':
+            # Binary Cross Entropy with class weights
+            class_weights = torch.tensor([weight_0, weight_1], dtype=torch.float, device=device)
+            loss_fn = nn.CrossEntropyLoss(weight=class_weights, reduction='mean')
+            print(f'  Using BCE Loss (CrossEntropyLoss) with class weights: [{weight_0:.4f}, {weight_1:.4f}]')
+        else:
+            # Focal Loss
+            focal_alpha = torch.tensor([weight_0, weight_1], dtype=torch.float, device=device)
+            focal_gamma = getattr(args, 'focal_gamma', 1.0)
+            loss_fn = FocalLoss(gamma=focal_gamma, alpha=focal_alpha, reduction='mean', num_classes=2)
+            print(f'  Using Focal Loss (gamma={focal_gamma}) with alpha: [{weight_0:.4f}, {weight_1:.4f}]')
         
         # Log class balance
         print(f'\n[CLASS BALANCE] Fold {kfold_index}:')
         print(f'  Train: Class 0={num_class_0} ({num_class_0/total_samples*100:.1f}%), Class 1={num_class_1} ({num_class_1/total_samples*100:.1f}%)')
-        print(f'  Focal Loss alpha: [{weight_0:.4f}, {weight_1:.4f}]')
         num_test_0 = (Y_test == 0).sum()
         num_test_1 = (Y_test == 1).sum()
         total_test = len(Y_test)
@@ -286,31 +424,66 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
                 train_mask_batch = torch.from_numpy(X_mask_train_final[idx_batch]).float().to(device)
                 batch_data = temporal_graphs_to_batch(
                     train_data_batch,
-                    # Disable pruning for dense graphs like BrainGNN
-                    threshold=None,
+                    # Use configurable threshold (default 0.0 = dense graph)
+                    threshold=args.edge_threshold if args.edge_threshold > 0.0 else None,
                     temporal_strategy=args.temporal_strategy,
                     window_mask=train_mask_batch
                 )
                 batch_data = batch_data.to(device)
                 batch_data.y = train_label_batch.to(device)
                 
-                # --- Scale debug (First batch of first epoch) ---
-                if epoch == 0 and i == 0:
-                    with torch.no_grad():
-                        x_stats = batch_data.x
-                        print(f"\n[DEBUG SCALE] Image: Mean={x_stats.mean():.4f}, Std={x_stats.std():.4f}, Max={x_stats.max():.4f}")
-                        if model.static_prompt is not None:
-                            p_stats = model.prompt_projector(model.static_prompt.to(device))
-                            print(f"[DEBUG SCALE] Prompt (Proj): Mean={p_stats.mean():.4f}, Std={p_stats.std():.4f}, Max={p_stats.max():.4f}")
-                        print(f"[DEBUG SCALE] Soft Prompt: Mean={model.soft_prompt.mean():.4f}, Std={model.soft_prompt.std():.4f}\n")
-                # ----------------------------------------------------------
+                # Generate subject prompts for this batch if enabled
+                subject_prompts_batch = None
+                if use_subject_prompt and demographics and index_to_file_id:
+                    subject_prompts_batch = []
+                    total_sites = 16  # ABIDE has 16 sites
+                    for batch_idx in idx_batch:
+                        # batch_idx is local to X_train_final, map to global index
+                        global_idx = train_index[train_indices_local[batch_idx]]
+                        if global_idx < len(index_to_file_id):
+                            file_id = index_to_file_id[global_idx]
+                            demo = demographics.get(file_id, {})
+                            age = demo.get('age', 25.0) if demo.get('age') is not None else 25.0
+                            sex = demo.get('sex', 1) if demo.get('sex') is not None else 1
+                            site_id = demo.get('site_id', args.site) if demo.get('site_id') else args.site
+                        else:
+                            # Fallback if index out of range
+                            age = 25.0
+                            sex = 1
+                            site_id = args.site
+                        prompt = generate_subject_prompt(age, sex, site_id, total_sites)
+                        subject_prompts_batch.append(prompt)
                 
-                # Enable debug only in first iteration of first epoch
-                debug_mode = (epoch == 0 and i == 0)
-                outputs, attention_weights, features_intermediate = model(batch_data, debug=debug_mode)
+                outputs, attention_weights, features_intermediate = model(
+                    batch_data, 
+                    subject_prompts=subject_prompts_batch,
+                    demographics=demographics if use_subject_prompt else None
+                )
                 
-                # Use Focal Loss (multi-class)
-                loss = focal_loss_fn(outputs, batch_data.y)
+                # Use selected loss function
+                loss = loss_fn(outputs, batch_data.y)
+                
+                # Disease-level prompt loss (L_disease)
+                loss_disease = torch.tensor(0.0, device=device, requires_grad=True)
+                if use_disease_prompt and disease_prompt_embeddings is not None:
+                    # features_intermediate is the representation after Population Graph (if enabled)
+                    # Shape: (batch_size, hidden_dim)
+                    subject_reps = features_intermediate  # (batch_size, hidden_dim)
+                    
+                    # Normalize for cosine similarity
+                    subject_reps_norm = F.normalize(subject_reps, p=2, dim=1)
+                    disease_emb_norm = F.normalize(disease_prompt_embeddings, p=2, dim=1)
+                    
+                    # Compute similarity matrix: (batch_size, num_classes)
+                    similarity_matrix = torch.mm(subject_reps_norm, disease_emb_norm.T)
+                    
+                    # Use cross-entropy: treat similarity as logits
+                    # The true class should have highest similarity
+                    loss_disease = F.cross_entropy(similarity_matrix, batch_data.y)
+                    
+                    # Add to total loss with weight lambda_disease
+                    lambda_disease = getattr(args, 'lambda_disease', 1.0)
+                    loss = loss + lambda_disease * loss_disease
                 
                 # Add regularization to avoid collapse to one class
                 # Penalizes when all predictions are from the same class
@@ -357,10 +530,6 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
                          # If shape doesn't match, skip TPK loss
                          print(f"[Warning] Unexpected attention_weights shape: {attention_weights.shape}, expected {(batch_size * num_nodes,)}")
                          loss_tpk = torch.tensor(0.0, device=device, requires_grad=True)
-                     
-                     # Log TPK loss in first iterations for debug
-                     if epoch == 0 and i == 0:
-                         print(f"[BrainGNN] TPK Loss: {loss_tpk.item():.4f}")
                 
                 loss = loss + (lambda_tpk * loss_tpk)
                 
@@ -381,59 +550,8 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
                 
                 # Update weights every accumulation_steps or at the end of epoch
                 if (i + 1) % args.accumulation_steps == 0 or (i + 1) == num_batches:
-                    # Detailed logging of gradients and outputs (first batch of selected epochs)
-                    if (epoch == 0 or epoch % 10 == 0) and i == 0:
-                        # Calculate gradient norm
-                        total_grad_norm = 0.0
-                        param_count = 0
-                        grad_norms = []
-                        for name, param in model.named_parameters():
-                            if param.grad is not None:
-                                param_grad_norm = param.grad.data.norm(2).item()
-                                total_grad_norm += param_grad_norm ** 2
-                                grad_norms.append((name, param_grad_norm))
-                                param_count += 1
-                        total_grad_norm = total_grad_norm ** 0.5
-                        
-                        # Log outputs, intermediate features and loss components
-                        with torch.no_grad():
-                            outputs_stats = outputs.detach()
-                            features_stats = features_intermediate.detach()
-                            focal_loss_val = focal_loss_fn(outputs_stats, batch_data.y).item()
-                            print(f"\n[DEBUG EPOCH {epoch}] Gradients: norm={total_grad_norm:.6f}, params_with_grad={param_count}")
-                            print(f"[DEBUG EPOCH {epoch}] Intermediate features (before fc1): mean={features_stats.mean():.4f}, "
-                                  f"std={features_stats.std():.4f}, min={features_stats.min():.4f}, max={features_stats.max():.4f}")
-                            print(f"[DEBUG EPOCH {epoch}] Outputs (logits): mean={outputs_stats.mean():.4f}, std={outputs_stats.std():.4f}, "
-                                  f"min={outputs_stats.min():.4f}, max={outputs_stats.max():.4f}")
-                            # Calculate loss per class for diagnosis
-                            with torch.no_grad():
-                                class_0_mask = (batch_data.y == 0)
-                                class_1_mask = (batch_data.y == 1)
-                                if class_0_mask.any():
-                                    loss_class_0 = focal_loss_fn(outputs_stats[class_0_mask], batch_data.y[class_0_mask]).item()
-                                else:
-                                    loss_class_0 = 0.0
-                                if class_1_mask.any():
-                                    loss_class_1 = focal_loss_fn(outputs_stats[class_1_mask], batch_data.y[class_1_mask]).item()
-                                else:
-                                    loss_class_1 = 0.0
-                            
-                            print(f"[DEBUG EPOCH {epoch}] Loss components: focal={focal_loss_val:.4f} "
-                                  f"(class0={loss_class_0:.4f}, class1={loss_class_1:.4f}), "
-                                  f"tpk={loss_tpk.item():.4f}, l1={l1_reg.item():.4f}, "
-                                  f"diversity={diversity_loss.item():.4f}, total={loss.item() * args.accumulation_steps:.4f}")
-                            
-                            # Log top 5 largest gradients
-                            if grad_norms:
-                                grad_norms_sorted = sorted(grad_norms, key=lambda x: x[1], reverse=True)[:5]
-                                print(f"[DEBUG EPOCH {epoch}] Top 5 grad norms: {[(n.split('.')[-1], f'{v:.6f}') for n, v in grad_norms_sorted]}")
-                    
                     # Gradient clipping for stability
-                    grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
-                    # Log if gradient was clipped
-                    if (epoch == 0 or epoch % 10 == 0) and i == 0 and grad_norm_before_clip > 1.0:
-                        print(f"[DEBUG EPOCH {epoch}] Gradient clipped: {grad_norm_before_clip:.4f} -> 1.0")
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     
                     optimizer.step()
                     optimizer.zero_grad()
@@ -460,13 +578,38 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
                         train_mask_batch = X_mask_train_final[idx_batch]
                         batch_data = temporal_graphs_to_batch(
                             train_data_batch,
-                            threshold=None,
+                            threshold=args.edge_threshold if args.edge_threshold > 0.0 else None,
                             temporal_strategy=args.temporal_strategy,
                             window_mask=train_mask_batch
                         )
                         batch_data = batch_data.to(device)
                         
-                        outputs, _, _ = model(batch_data, debug=False)
+                        # Generate subject prompts for train batch if enabled
+                        train_subject_prompts = None
+                        if use_subject_prompt and demographics and index_to_file_id:
+                            train_subject_prompts = []
+                            total_sites = 16
+                            for batch_idx in idx_batch:
+                                # batch_idx is local to X_train_final, map to global index
+                                global_idx = train_index[train_indices_local[batch_idx]]
+                                if global_idx < len(index_to_file_id):
+                                    file_id = index_to_file_id[global_idx]
+                                    demo = demographics.get(file_id, {})
+                                    age = demo.get('age', 25.0) if demo.get('age') is not None else 25.0
+                                    sex = demo.get('sex', 1) if demo.get('sex') is not None else 1
+                                    site_id = demo.get('site_id', args.site) if demo.get('site_id') else args.site
+                                else:
+                                    age = 25.0
+                                    sex = 1
+                                    site_id = args.site
+                                prompt = generate_subject_prompt(age, sex, site_id, total_sites)
+                                train_subject_prompts.append(prompt)
+                        
+                        outputs, _, _ = model(
+                            batch_data,
+                            subject_prompts=train_subject_prompts,
+                            demographics=demographics if use_subject_prompt else None
+                        )
                         _, indices = torch.max(outputs, dim=1)
                         preds = indices.cpu()
                         acc += metrics.accuracy_score(preds, train_label_batch)
@@ -505,15 +648,41 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
                         
                         batch_data_val = temporal_graphs_to_batch(
                             val_data_batch,
-                            threshold=None,
+                            threshold=args.edge_threshold if args.edge_threshold > 0.0 else None,
                             temporal_strategy=args.temporal_strategy,
                             window_mask=val_mask_batch
                         )
                         batch_data_val = batch_data_val.to(device)
                         batch_data_val.y = torch.from_numpy(batch_val_Y).long().to(device)
                         
-                        outputs_val, _, _ = model(batch_data_val, debug=False)
-                        val_loss = focal_loss_fn(outputs_val, batch_data_val.y)
+                        # Generate subject prompts for validation batch if enabled
+                        val_subject_prompts = None
+                        if use_subject_prompt and demographics and index_to_file_id:
+                            val_subject_prompts = []
+                            total_sites = 16
+                            val_batch_indices = val_indices_local[start_idx:end_idx]
+                            for val_batch_idx in val_batch_indices:
+                                # Map to global index: val_batch_idx is local to X_train, map to original dataset
+                                global_idx = train_index[val_batch_idx]
+                                if global_idx < len(index_to_file_id):
+                                    file_id = index_to_file_id[global_idx]
+                                    demo = demographics.get(file_id, {})
+                                    age = demo.get('age', 25.0) if demo.get('age') is not None else 25.0
+                                    sex = demo.get('sex', 1) if demo.get('sex') is not None else 1
+                                    site_id = demo.get('site_id', args.site) if demo.get('site_id') else args.site
+                                else:
+                                    age = 25.0
+                                    sex = 1
+                                    site_id = args.site
+                                prompt = generate_subject_prompt(age, sex, site_id, total_sites)
+                                val_subject_prompts.append(prompt)
+                        
+                        outputs_val, _, _ = model(
+                            batch_data_val,
+                            subject_prompts=val_subject_prompts,
+                            demographics=demographics if use_subject_prompt else None
+                        )
+                        val_loss = loss_fn(outputs_val, batch_data_val.y)
                         if val_loss.dim() == 0:
                             val_loss = val_loss * (end_idx - start_idx)
                         
@@ -557,13 +726,38 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
                 test_mask_batch = X_mask_test
                 batch_data = temporal_graphs_to_batch(
                     test_data_batch,
-                    threshold=None,
+                    threshold=args.edge_threshold if args.edge_threshold > 0.0 else None,
                     temporal_strategy=args.temporal_strategy,
                     window_mask=test_mask_batch
                 )
                 batch_data = batch_data.to(device)
                 
-                outputs, _, features_intermediate = model(batch_data, debug=False)
+                # Generate subject prompts for test set if enabled
+                test_subject_prompts = None
+                if use_subject_prompt and demographics and index_to_file_id:
+                    test_subject_prompts = []
+                    total_sites = 16
+                    for test_local_idx in range(len(X_test)):
+                        # Map to global index
+                        global_test_idx = test_index[test_local_idx]
+                        if global_test_idx < len(index_to_file_id):
+                            file_id = index_to_file_id[global_test_idx]
+                            demo = demographics.get(file_id, {})
+                            age = demo.get('age', 25.0) if demo.get('age') is not None else 25.0
+                            sex = demo.get('sex', 1) if demo.get('sex') is not None else 1
+                            site_id = demo.get('site_id', args.site) if demo.get('site_id') else args.site
+                        else:
+                            age = 25.0
+                            sex = 1
+                            site_id = args.site
+                        prompt = generate_subject_prompt(age, sex, site_id, total_sites)
+                        test_subject_prompts.append(prompt)
+                
+                outputs, _, features_intermediate = model(
+                    batch_data,
+                    subject_prompts=test_subject_prompts,
+                    demographics=demographics if use_subject_prompt else None
+                )
                 
                 # Clear memory after inference
                 del batch_data
@@ -573,25 +767,6 @@ def train_and_test_baseline_model(args, path_data, path_data_mask, path_label, l
                 _, indices = torch.max(probs, dim=1)
                 pre = indices.cpu().numpy()
                 label_test = Y_test
-                
-                # Debug: check predictions and probabilities distribution
-                if epoch == 0 or epoch % 10 == 0:
-                    unique, counts = np.unique(pre, return_counts=True)
-                    probs_np = probs.detach().cpu().numpy()
-                    features_np = features_intermediate.detach().cpu().numpy()
-                    # Probability statistics
-                    prob_mean = probs_np.mean(axis=0)
-                    prob_std = probs_np.std(axis=0)
-                    prob_min = probs_np.min(axis=0)
-                    prob_max = probs_np.max(axis=0)
-                    # Average difference between the two classes
-                    prob_diff = np.abs(probs_np[:, 0] - probs_np[:, 1]).mean()
-                    print(f'  Debug: Predictions distribution: {dict(zip(unique, counts))}')
-                    print(f'  Debug: Intermediate features - mean={features_np.mean():.4f}, std={features_np.std():.4f}, '
-                          f'min={features_np.min():.4f}, max={features_np.max():.4f}')
-                    print(f'  Debug: Output range: [{outputs.min():.3f}, {outputs.max():.3f}]')
-                    print(f'  Debug: Probabilities - Mean: {prob_mean}, Std: {prob_std}, Min: {prob_min}, Max: {prob_max}')
-                    print(f'  Debug: Average prob difference between classes: {prob_diff:.4f} (should be > 0.1 for confident predictions)')
                 
                 acc_test = metrics.accuracy_score(label_test, pre)
                 fpr, tpr, _ = metrics.roc_curve(label_test, pre)

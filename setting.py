@@ -46,6 +46,28 @@ def get_args():
     parser.add_argument('--site', type=str, choices=['NYU', 'UCLA', 'UM', 'USM'], default='NYU',
                         help="Choose the target site for evaluation")
     
+    # Ablation study
+    parser.add_argument("--ablation_mode", type=str, 
+                        choices=['full', 'no_prompt', 'random_prompt', 'static_prompt'],
+                        default='full',
+                        help="Ablation mode: 'full' (BERT + soft prompt), 'no_prompt' (no prompts), 'random_prompt' (random init), 'static_prompt' (BERT only)")
+    parser.add_argument("--ablation_mask", type=str,
+                        choices=['with_mask', 'no_mask'],
+                        default='with_mask',
+                        help="Global adjacency mask ablation: 'with_mask' (learnable mask), 'no_mask' (use original edge weights)")
+    parser.add_argument("--ablation_pooling", type=str,
+                        choices=['attention', 'mean', 'max'],
+                        default='attention',
+                        help="Pooling strategy ablation: 'attention' (global attention), 'mean' (mean pooling), 'max' (max pooling)")
+    
+    # Multi-level prompts (BrainPrompt paper)
+    parser.add_argument("--use_subject_prompt", action='store_true',
+                        help="Enable subject-level prompts for Population Graph construction")
+    parser.add_argument("--use_disease_prompt", action='store_true',
+                        help="Enable disease-level prompts for L_disease loss")
+    parser.add_argument("--lambda_disease", type=float, default=1.0,
+                        help="Weight for disease-level prompt loss (L_disease). Default: 1.0")
+    
     # Number of source domains for prompt fusion (only for target_model)
     parser.add_argument('--num_sources', type=int, choices=[1, 3, 6, 10, 12, 15], default=1,
                         help="Number of source domains to use for prompt fusion")
@@ -62,7 +84,7 @@ def get_args():
                         help="Learning rate (increased from original for better learning)")
     parser.add_argument("--decay", type=float, default=0.0, 
                         help="Weight decay (set to 0.0 to avoid erasing weights)")
-    parser.add_argument("--dropout", type=float, default=0.5, help="Dropout rate")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument('--temperature', type=int, default=8, 
                         help="Temperature parameter for prompt fusion (target model)")
     
@@ -75,14 +97,24 @@ def get_args():
     # GAT-specific hyperparameters
     parser.add_argument("--gat_heads", type=int, default=4, 
                         help="Number of attention heads in first GAT layer")
-    parser.add_argument("--gat_hidden_dim", type=int, default=32, 
-                        help="Hidden dimension for GAT layers")
+    parser.add_argument("--gat_hidden_dim", type=int, default=64, 
+                        help="Hidden dimension for GAT layers (increased from 32 for better capacity)")
     parser.add_argument("--gat_num_layers", type=int, default=2, 
                         help="Number of GAT layers")
     parser.add_argument("--temporal_strategy", type=str, choices=['mean', 'separate'], default='mean',
                         help="Strategy for handling temporal windows: 'mean' (average) or 'separate' (process separately)")
     parser.add_argument("--edge_threshold", type=float, default=0.0,
                         help="Threshold for sparsifying graphs. 0.0 = dense graph (keep all connections)")
+    
+    # FC layer improvements
+    parser.add_argument("--fc_hidden_dim", type=int, default=64,
+                        help="Hidden dimension for FC classification layers")
+    parser.add_argument("--fc_num_layers", type=int, default=1, choices=[1, 2, 3],
+                        help="Number of hidden FC layers (1, 2, or 3)")
+    parser.add_argument("--fc_activation", type=str, choices=['relu', 'elu', 'gelu'], default='relu',
+                        help="Activation function for FC layers: 'relu', 'elu', or 'gelu'")
+    parser.add_argument("--fc_use_batchnorm", action='store_true',
+                        help="Use BatchNorm in FC layers (may help with overfitting)")
     
     # Regularization
     parser.add_argument("--l1_weight", type=float, default=0.01,
@@ -101,6 +133,8 @@ def get_args():
                         help="Number of epochs to wait before early stopping")
     
     # Loss function parameters
+    parser.add_argument("--loss_type", type=str, choices=['focal', 'bce'], default='focal',
+                        help="Loss function type: 'focal' for Focal Loss, 'bce' for CrossEntropyLoss")
     parser.add_argument("--focal_gamma", type=float, default=1.0,
                         help="Gamma parameter for Focal Loss (0.0=CE, >0.0=Focal, higher=focus on hard examples)")
     parser.add_argument("--lambda_tpk", type=float, default=0.1,

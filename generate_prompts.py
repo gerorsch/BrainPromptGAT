@@ -1,11 +1,36 @@
 """
-Gera embeddings textuais (LLM) para as 116 regiões do atlas AAL
-e salva em BrainPromptGAT/data/roi_bert_embeddings.pt
+Generate textual embeddings (LLM) for the 116 regions of the AAL atlas
+and save to BrainPromptGAT/data/roi_bert_embeddings.pt
+
+This script follows the BrainPrompt paper approach:
+- Uses ROI-specific descriptions (generated via ChatGPT)
+- Encodes with Llama-encoder-1.0B (LLM2Vec) instead of SentenceTransformer
+- Aligns dimensions with linear projection for additive injection
 """
 import os
 import torch
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import json
+
+# Try to import Llama-encoder-1.0B (LLM2Vec)
+try:
+    from llm2vec import LLM2Vec
+    HAS_LLM2VEC = True
+except ImportError:
+    HAS_LLM2VEC = False
+    print("Warning: llm2vec not installed. Trying transformers directly...")
+    try:
+        from transformers import AutoModel, AutoTokenizer
+        HAS_TRANSFORMERS = True
+    except ImportError:
+        HAS_TRANSFORMERS = False
+        print("Warning: transformers not installed. Falling back to SentenceTransformer...")
+        try:
+            from sentence_transformers import SentenceTransformer
+            HAS_SENTENCE_TRANSFORMER = True
+        except ImportError:
+            HAS_SENTENCE_TRANSFORMER = False
+
 try:
     from nilearn import datasets
 except Exception:
@@ -59,25 +84,82 @@ def generate_roi_embeddings(save_dir=None, allow_download=True):
         print("1) nilearn indisponível ou download desabilitado. Usando lista offline embutida.")
         labels = _aal_labels_offline()
 
-    print("2) Construindo prompts textuais para cada ROI...")
+    print("2) Loading ROI-specific descriptions...")
+    descriptions_path = os.path.join(save_dir, "roi_descriptions.json")
+    
+    if os.path.exists(descriptions_path):
+        print(f"   Loading from: {descriptions_path}")
+        with open(descriptions_path, 'r', encoding='utf-8') as f:
+            roi_descriptions = json.load(f)
+        print(f"   Loaded {len(roi_descriptions)} descriptions")
+    else:
+        print(f"   Warning: {descriptions_path} not found!")
+        print("   Falling back to generic template. Run generate_roi_descriptions.py first for better results.")
+        roi_descriptions = None
+    
+    print("3) Building text prompts for each ROI...")
     text_prompts = []
     for label in labels:
-        clean = label.replace("_", " ")
-        prompt = (
-            f"The brain region {clean} is associated with functional connectivity "
-            f"in autism spectrum disorder."
-        )
+        if roi_descriptions and label in roi_descriptions:
+            # Use specific description from ChatGPT
+            prompt = roi_descriptions[label]
+        else:
+            # Fallback to generic template
+            clean = label.replace("_", " ")
+            prompt = (
+                f"The brain region {clean} is associated with functional connectivity "
+                f"in autism spectrum disorder."
+            )
         text_prompts.append(prompt)
-    print(f"   Exemplo: {text_prompts[0]}")
+    
+    print(f"   Example ({labels[0]}): {text_prompts[0][:80]}...")
 
-    print("3) Codificando texto com SentenceTransformer (all-MiniLM-L6-v2)...")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    embeddings = model.encode(text_prompts, convert_to_numpy=True, show_progress_bar=True)
-    embeddings = torch.tensor(embeddings, dtype=torch.float32)
-    print(f"   Shape dos embeddings: {embeddings.shape}")
+    print("4) Encoding text with Llama-encoder-1.0B (LLM2Vec)...")
+    
+    if HAS_LLM2VEC:
+        # Use LLM2Vec (recommended approach from paper)
+        print("   Using llm2vec package...")
+        model = LLM2Vec.from_pretrained("knowledgator/Llama-encoder-1.0B")
+        embeddings = model.encode(text_prompts, convert_to_numpy=True, show_progress_bar=True)
+        embeddings = torch.tensor(embeddings, dtype=torch.float32)
+    elif HAS_TRANSFORMERS:
+        # Fallback: Use transformers directly
+        print("   Using transformers package directly...")
+        tokenizer = AutoTokenizer.from_pretrained("knowledgator/Llama-encoder-1.0B")
+        model = AutoModel.from_pretrained("knowledgator/Llama-encoder-1.0B")
+        model.eval()  # Set to evaluation mode
+        
+        # Encode each prompt
+        embeddings_list = []
+        with torch.no_grad():
+            for prompt in text_prompts:
+                inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                outputs = model(**inputs)
+                # Use mean pooling over sequence length
+                embedding = outputs.last_hidden_state.mean(dim=1).squeeze()
+                embeddings_list.append(embedding.numpy())
+        
+        embeddings = torch.tensor(np.array(embeddings_list), dtype=torch.float32)
+    elif HAS_SENTENCE_TRANSFORMER:
+        # Final fallback: Use SentenceTransformer (not ideal, but works)
+        print("   Warning: Using SentenceTransformer as fallback (not matching paper)")
+        print("   Install llm2vec or transformers for proper implementation")
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        embeddings = model.encode(text_prompts, convert_to_numpy=True, show_progress_bar=True)
+        embeddings = torch.tensor(embeddings, dtype=torch.float32)
+    else:
+        raise ImportError(
+            "No suitable encoder found. Install one of:\n"
+            "  - llm2vec: pip install llm2vec\n"
+            "  - transformers: pip install transformers\n"
+            "  - sentence-transformers: pip install sentence-transformers"
+        )
+    
+    print(f"   Embeddings shape: {embeddings.shape}")
+    print(f"   Expected shape: (116, {embeddings.shape[1]})")
 
     torch.save(embeddings, save_path)
-    print(f"4) Salvo em: {save_path}")
+    print(f"5) Saved to: {save_path}")
     return save_path
 
 
